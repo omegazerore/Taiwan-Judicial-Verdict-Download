@@ -1,0 +1,12 @@
+pandas
+numpy
+jupyter
+jupyterlab
+selenium
+webdriver-manager
+bs4
+pyyaml
+pip
+user_agent
+undetected-chromedriver
+dill
