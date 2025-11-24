@@ -7,7 +7,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 
 from src.io.path_definition import get_project_dir
-from src.logic_v2 import retrieve_case_by_day
+from src.logic.logic_v2 import retrieve_case_by_day
 
 path_to_exe = os.path.join(get_project_dir(), "chromedriver-win64", "chromedriver.exe")
 
