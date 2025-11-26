@@ -1,77 +1,215 @@
 import argparse
+import asyncio
 import os
-from multiprocessing.pool import ThreadPool
 
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 from src.io.path_definition import get_project_dir
 
+# --------------------------------
+# Helper: chunk list into batches
+# --------------------------------
+def chunk_list(data, size):
+    """Yield successive sublists of fixed size from a list.
 
-path_to_exe = os.path.join(get_project_dir(), "chromedriver-win64", "chromedriver.exe")
+    This utility function is used to split a long list of URLs into smaller
+    batches for concurrent processing.
 
-if os.path.isfile(path_to_exe):
-    service = Service(path_to_exe)
-else:
-    raise FileNotFoundError(f"File {path_to_exe} not found")
+    Args:
+        data (list): The list to be chunked.
+        size (int): The maximum number of items per chunk.
 
+    Yields:
+        list: A sublist containing up to ``size`` elements.
+    """
 
-def access_url_content(url: str) -> None:
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--window-size=1920,1080")
-
-    driver = webdriver.Chrome(service=service,
-                              options=options
-                              )
-    driver.get(url)
-
-    related_law = WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, 'ul[class="rela-law"]'))
-    )
-
-    related_law = related_law.text
-
-    htmlcontent = WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, 'div[class="htmlcontent"]'))
-    )
-
-    htmlcontent = htmlcontent.text
-
-    history = WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.ID, 'JudHis'))
-    )
-
-    history = history.text
-
-    return {"url": url,
-            "related_law": related_law,
-            "htmlcontent": htmlcontent,
-            "history": history}
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
 
 
-# -----------------------------
-#  Batching helper
-# -----------------------------
-def chunk_list(data, chunk_size):
-    """Yield chunks of list with max size = chunk_size."""
-    for i in range(0, len(data), chunk_size):
-        yield data[i:i + chunk_size]
+# --------------------------------
+# Scrape a single URL (async)
+# --------------------------------
+async def fetch(browser, url):
+    """Scrape a single URL using Playwright and extract specific court fields.
+
+    The function loads the target page, waits for key DOM selectors, and uses
+    BeautifulSoup to parse the HTML content for elements such as:
+    - Related laws
+    - Judgment content
+    - Historical judgment records
+
+    Timeout for each selector is 10 seconds; missing sections are logged and
+    returned as empty strings.
+
+    Args:
+        browser (playwright.async_api.Browser): A Playwright browser instance.
+        url (str): The webpage URL to scrape.
+
+    Returns:
+        dict: A dictionary with the following keys:
+            - ``歷審裁判``: Historical judgment records.
+            - ``相關法條``: Related laws.
+            - ``裁定``: Judgment HTML content.
+            - ``url``: The scraped URL.
+    """
+
+    page = await browser.new_page()
+    await page.goto(url, wait_until="load")
+
+    rela_law_activation = False
+
+    try:
+        await page.wait_for_selector("ul.rela-law li", timeout=10000)
+        rela_law_activation = True
+    except Exception:
+        print(f"Timeout while waiting for ul.rela-law in {url}")
+
+    htmlcontent_activation = False
+
+    try:
+        await page.wait_for_selector("div.htmlcontent", timeout=10000)
+        htmlcontent_activation = True
+    except Exception:
+        print(f"Timeout while waiting for div.htmlcontent in {url}")
+
+    judhis_activation = False
+
+    try:
+        await page.wait_for_selector("#JudHis", timeout=10000)
+        judhis_activation = True
+    except Exception:
+        print(f"Timeout while waiting for JudHis in {url}")
+
+    html = await page.content()
+    await page.close()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    if rela_law_activation:
+        related_law = ", ".join([li.get_text(strip=True) for li in soup.select("ul.rela-law li")])
+    else:
+        related_law = ""
+    if htmlcontent_activation:
+        htmlcontent = "".join([div.get_text(strip=True) for div in soup.select("div.htmlcontent")])
+    else:
+        htmlcontent = ""
+    if judhis_activation:
+        history = ", ".join([li.get_text(strip=True) for li in soup.select("#JudHis ul li")])
+    else:
+        history = ""
+
+    return {"歷審裁判": history,
+            "相關法條": related_law,
+            "裁定": htmlcontent,
+            "url": url}
 
 
+# --------------------------------
+# Wrapper with retry logic
+# --------------------------------
+async def fetch_with_retry(browser, url):
+    """Fetch data from a URL with retry logic.
+
+    Retries the ``fetch`` function up to a global ``RETRIES`` limit when an
+    exception occurs. Each retry waits one second before continuing.
+
+    Args:
+        browser (playwright.async_api.Browser): Playwright browser instance.
+        url (str): The target URL.
+
+    Returns:
+        dict: Scraped fields returned by ``fetch`` upon success.
+              If all retries fail, returns:
+              ``{"url": url, "error": "Failed after retries"}``
+    """
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return await fetch(browser, url)
+        except Exception as e:
+            print(f"Retry {attempt}/{RETRIES} failed for {url}: {e}")
+            await asyncio.sleep(1)
+    return {"url": url, "error": "Failed after retries"}
+
+
+# --------------------------------
+# Process a batch concurrently
+# --------------------------------
+async def process_batch(browser, urls):
+    """Process a batch of URLs concurrently with a semaphore.
+
+    Each URL is processed by ``fetch_with_retry`` but limited by the global
+    concurrency level (``CONCURRENCY``). All results are gathered using
+    ``asyncio.gather``.
+
+    Args:
+        browser (playwright.async_api.Browser): Playwright browser instance.
+        urls (list[str]): List of URLs in the current batch.
+
+    Returns:
+        list[dict]: A list of dictionaries generated by ``fetch_with_retry``.
+    """
+
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
+    async def sem_task(url):
+        async with semaphore:
+            return await fetch_with_retry(browser, url)
+
+    tasks = [sem_task(u) for u in urls]
+    return await asyncio.gather(*tasks)
+
+
+# --------------------------------
+# Main execution
+# --------------------------------
+async def main(urls: list[str]):
+    """Run the scraping pipeline in batches with concurrency control.
+
+    This function orchestrates:
+    - Launching the Playwright browser
+    - Splitting input URLs into batches
+    - Processing each batch concurrently
+    - Collecting all scraping results
+
+    Args:
+        urls (list[str]): Full list of URLs to scrape.
+
+    Returns:
+        list[dict]: Combined scraping results from all batches.
+    """
+    all_results = []
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        for batch_index, url_batch in enumerate(chunk_list(urls, BATCH_SIZE), start=1):
+            print(f"Processing batch {batch_index} ({len(url_batch)} urls)")
+
+            batch_results = await process_batch(browser, url_batch)
+            all_results.extend(batch_results)
+
+            print(f"Batch {batch_index} done. Total collected: {len(all_results)}")
+
+    print("All batches complete!")
+    return all_results
+
+
+# Run async main
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pool_size', type=int, default=2, help='多線程下載的線程數量')
+    parser.add_argument('--concurrency', type=int, default=2, help='同時處理的頁面數量')
     parser.add_argument('--batch_size', type=int, default=10, help='每個批次處理的 URL 數量')
     parser.add_argument('--date', type=str, help='判決書日期編號 民國年_月_日', required=True)
+    parser.add_argument('--test', action='store_true', help="執行測試模式，只處理前 100 筆資料")
 
     args = parser.parse_args()
+
+    BATCH_SIZE = args.batch_size  # 100 URLs per batch
+    CONCURRENCY = args.concurrency # 20 pages open at the same time
+    RETRIES = 3  # retry failed URLs
 
     file_path = os.path.join(get_project_dir(), "data", f"cases_{args.date}.csv")
     if not os.path.isfile(file_path):
@@ -86,31 +224,15 @@ if __name__ == "__main__":
     if os.path.isfile(output_filepath):
         raise FileExistsError(f"File {output_filepath} already exists")
 
-    POOL_SIZE = args.pool_size
-    BATCH_SIZE = args.batch_size
-    # We only need 2 for this case
-
-    all_results = []
-
     df_raw = pd.read_csv(file_path, index_col=0)
+    if args.test:
+        df_raw = df_raw.head(10)
     all_urls = df_raw['url'].tolist()
 
-    for batch_index, url_batch in enumerate(chunk_list(all_urls, BATCH_SIZE), start=1):
-        print(f"Processing batch {batch_index} with {len(url_batch)} URLs...")
+    results = asyncio.run(main(urls=all_urls))
 
-        pool = ThreadPool(POOL_SIZE)
-        async_results = [pool.apply_async(access_url_content, args=(u,)) for u in url_batch]
-
-        pool.close()
-        pool.join()
-
-        # Collect results
-        batch_results = [r.get() for r in async_results]
-        all_results.extend(batch_results)
-
-        print(f"Completed batch {batch_index}.")
-
-    df_output = pd.DataFrame(all_results)
+    df_output = pd.DataFrame(results)
     df_output = df_raw.merge(df_output, on="url", how="left")
 
     df_output.to_csv(output_filepath, index=False)
+

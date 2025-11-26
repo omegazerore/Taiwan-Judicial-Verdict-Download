@@ -16,11 +16,13 @@ The result will be saved in the `data` directory as a CSV file named `cases_[YEA
 ### 使用以下命令來下載指定日期的判決書內容：
 ```bash
 conda activate env
-python -m access_url_content --pool_size 4 --batch_size 100 --date 114_11_20 
+python -m access_url_content --concurrency 2 --batch_size 100 --date 114_11_20 
 ```
 
 The code will load the verdicts for the specified date. Replace `114_11_20` with the desired date in the format `YYY_MM_DD`.
 The result will be saved in the `data_processed` directory as a CSV file named `cases_processed_[DATE].csv`.
+
+concurrency @ 2 means using 2 threads to download the verdicts concurrently. So far concurrency up to 2 is tested to be stable.
 
 ## Chrome Driver 下載 :
 
